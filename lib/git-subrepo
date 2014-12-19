@@ -42,7 +42,8 @@ a,all       Perform command on all current subrepos
 b,branch=   Specify an upstream branch
 r,remote=   Specify an upstream remote
 u,update    Add the --branch and/or --remote overrides to .gitrepo
-continue    Finish the (pull|push) operation after checkout/hand-merge
+continue    Finish the (pull|push) operation after checkout/hand-merge, or conflict during pull
+abort       Abort the pull operation after conflict during pull
 
 reclone     Replace current content with upstream content
 rebase      Rebase upstream changes
@@ -72,6 +73,7 @@ main() {
   local fetch_wanted=false    # Fetch requested for checkout
   local update_wanted=false   # Update .gitrepo with --branch and/or --remote
   local continue_wanted=false # Continue/finish a pull or push
+  local abort_wanted=false    # Abort a pull or push in progress
   local command_remote='???'  # Remote repo for git-subrepo
   local command_commit='???'  # Commit of git-repo being used
 
@@ -176,29 +178,33 @@ command:clone() {
 # TODO Command needs rewrite:
 command:pull() {
   command-setup +subdir
-  subrepo:fetch
-
-  # Check if we already are up to date:
-  if [ "$upstream_head" == "$subrepo_commit" ]; then
-    say "subrepo '$subdir' is up to date"
-    return
-  fi
 
   #Writes best common-ancestor to $subrepo_parent
   get-best-common-ancestor-for-merge
 
-  OUT=true RUN git log --max-count=1 --format=%T "$upstream_head"
-
-  # Create a new commit object from the upstream subrepo HEAD^{tree} with a parent
-  #  being the best common-ancestor just found:
-  OUT=true RUN git commit-tree "$output" -p "$subrepo_parent" -m "$(action-message)"
-  update_commit="$output"
-
-  # TODO:
-  # This merge can fail, so we need to checkout/merge/remerge instead.
-
-  # Merge the update with the subtree strategy:
-  RUN git merge --no-ff -s recursive -X subtree="$subdir" -X patience "$update_commit"
+  if [ $continue_wanted || $abort_wanted ];  then
+    # Get the subrepo HEAD commit:
+    OUT=true RUN git rev-parse FETCH_HEAD
+    upstream_head="$output"
+    # Read the $update_commit cached earlier.
+    FAIL=false OUT=true RUN git config --local --get "subrepo.mergeInProgress.$(echo -n $subdir | tr -c [:alnum:] -)"
+    if [ -z "$output" ]; then
+      # If the cached entry doesn't exist, it means there is nothing to continue.
+      error "Unable to $1 merge as there is no cached prior attempt to merge."
+    else
+      update_commit="$output"
+      RUN git merge --no-ff -s recursive -X subtree="$subdir" -X patience "$update_commit"
+    fi
+    if $abort_wanted; then
+      # Delete cache of failed merge, as we know it had succeeded.
+      FAIL=false RUN git config --local --unset-all "subrepo.mergeInProgress.$(echo -n $subdir | tr -c [:alnum:] -)"
+      return;
+    fi
+  else
+    attempt-subrepo-pull
+    # In the event a hand merge is needed, don't continue this command..
+    [ "$OK" = "return" ] && return
+  fi
 
   OK || { say "git subrepo '$subdir' failed to complete pull"; return; }
   # Now, if our subrepo pull has the same parent as the merge commit (i.e. HEAD^ equals HEAD^2^) then we don't need to clean
@@ -213,11 +219,14 @@ command:pull() {
 
     # The update_commit just got rewritten. Need new id:
     FAIL=false OUT=true RUN git rev-parse HEAD^2
+    say "Canidate:$output OK:$OK"
     if ! OK; then
       # This bit helps when there is no second parent- which occurs in certain workflows.
       FAIL=false OUT=true RUN git rev-parse HEAD
+      say "Canidate:$output OK:$OK"
     fi
     update_commit="$output"
+    say "update_commit:$update_commit"
   fi
 
   # Update the subdir/.gitrepo file:
@@ -250,7 +259,9 @@ command:push() {
     RUN git rebase --abort #Abort prior failed rebase.
     get-last-subrepo-merge-log-entry
     if [ -n "$output" ]; then
-      FAIL=false RUN git rebase --onto "$upstream_head" "$output" "$checkout_branch"
+      local last_subrepo_merge_commit="$output"
+      #say git rebase --onto "$upstream_head" "$last_subrepo_merge_commit" "$checkout_branch"
+      FAIL=false RUN git rebase --onto "$upstream_head" "$last_subrepo_merge_commit" "$checkout_branch"
     else
       say "Unable to rebase changes from local branch onto subrepo origin as git log entry of last $subdir clone/merge wasn't found."
       OK=false
@@ -562,6 +573,7 @@ get-command-options() {
       --fetch)    fetch_wanted=true ;;
       --graft)    graft_wanted=true ;;
       --continue) continue_wanted=true ;;
+      --abort)    abort_wanted=true ;;
       --reclone)  merge_strategy=reclone ;;
       --rebase)   merge_strategy=rebase ;;
       --merge)    merge_strategy=merge ;;
@@ -584,6 +596,10 @@ get-command-options() {
   if $continue_wanted; then
     [[ "$command" =~ ^(pull|push)$ ]] ||
       error "can't use '--continue' with '$command' command"
+  fi
+  if $abort_wanted; then
+    [[ "$command" =~ ^(pull|push)$ ]] ||
+      error "can't use '--abort' with '$command' command"
   fi
   if $update_wanted; then
     [ -n "$subrepo_branch" -o -n "$subrepo_remote" ] ||
@@ -838,10 +854,12 @@ assert-repo-is-ready() {
     git update-index -q --ignore-submodules --refresh
     git diff-files --quiet --ignore-submodules ||
       error "can't $command subrepo. Unstaged changes."
-    git diff-index --quiet --ignore-submodules HEAD ||
-      error "can't $command subrepo. Working tree has changes."
-    git diff-index --quiet --cached --ignore-submodules HEAD ||
-      error "can't $command subrepo. Index has changes."
+    if [ ! $continue_wanted ] && [ ! $abort_wanted ]; then
+      git diff-index --quiet --ignore-submodules HEAD ||
+        error "can't $command subrepo. Working tree has changes."
+      git diff-index --quiet --cached --ignore-submodules HEAD ||
+        error "can't $command subrepo. Index has changes."
+    fi
   fi
 
   # For now, only support actions from top of repo:
@@ -875,14 +893,82 @@ add-subrepo() {
   subrepos+=("$1")
 }
 
+# Attempts to pull and merge upstream subrepo into $subdir of
+#  $original_head_branch
+attempt-subrepo-pull() {
+  fetch-subrepo
+
+  # Check if we already are up to date:
+  if [ "$upstream_head" == "$subrepo_commit" ]; then
+    error "subrepo '$subdir' is up to date"
+  fi
+
+  #Writes best common-ancestor to $subrepo_parent
+  get-best-common-ancestor-for-merge
+
+  OUT=true RUN git log --max-count=1 --format=%T "$upstream_head"
+
+  # Create a new commit object from the upstream subrepo HEAD^{tree} with a
+  #  parent being the best common-ancestor just found:
+  OUT=true RUN git commit-tree "$output" -p "$subrepo_parent" -m "$(action-message)"
+  update_commit="$output"
+
+  # Merge the update with the subtree strategy:
+  FAIL=false OUT=true RUN git merge --no-ff -s recursive -X subtree="$subdir" -X patience "$update_commit"
+  if ! OK; then
+    # Tell the user verbosely what file(s) the merge tool was not able to
+    #  automatically merge:
+    say "$output"
+    # Undo the merge's automatic deletion of $subdir/.gitrepo, so that the
+    #  user can run subrepo commands in the meantime:
+    RUN git reset -- "$subdir"/.gitrepo
+    RUN git checkout -- "$subdir"/.gitrepo
+    # We now ask the user to hand-merge using the mergetool, then --continue or
+    #  -- abort through our tool (as we have to keep track of what is going on)
+    say "
+When you are done resolving the conflict(s), you can complete the pull with:
+
+  git commit
+  git subrepo pull $subdir --continue
+
+To abort the subrepo pull, run this command:
+
+  git subrepo pull $subdir --abort
+"
+
+    # Cache $update_commit for usage later in the event the user decides
+    #  to attempt to hand merge then continue, or abort.
+    RUN git config --local "subrepo.mergeInProgress.$(echo -n $subdir | tr -c [:alnum:] -)" "$update_commit"
+    OK=return
+  fi
+}
+
 # Writes best common-ancestor to $subrepo_parent
 get-best-common-ancestor-for-merge() {
+  say "get-best-common-ancestor initial subrepo_parent:$subrepo_parent"
   # Writes to $subrepo_parent if relevant clone/pull subrepo log entry found; writes latest match.
   get-last-original-head-branch-subrepo-log-hash #Note log doesn't contain last subrepo push.
+  say "Found in log subrepo_parent:$subrepo_parent"
 
   # Now, if there were no commits since the above we know we have the best common-ancestor:
-  OUT=true RUN git rev-parse "$original_head_branch"
-  if [ "$output" = "$subrepo_parent" ]; then
+  if [ "$original_head_commit" = "$subrepo_parent" ]; then
+    return
+  fi
+
+  # In the event of a collision on a prior pull, a merge commit was made
+  #  and $subrepo_parent is the parent of that merge commit. See if this is
+  #  the case. If this is the case then $subrepo_parent^ is the what we
+  #  want to set $subrepo_parent to, as this will be used in a later
+  #  filter-branch command (given this is a --continue of a pull?).
+  FAIL=false OUT=true RUN git log --grep="Merge commit '$subrepo_parent'" -n 1 --pretty="format:%H"
+  if [ -n "$output" ]; then
+    FAIL=false OUT=true RUN git rev-parse "$subrepo_parent"^
+    subrepo_parent="$output"
+    say "Event of collision on prior pull subrepo_parent:$subrepo_parent"
+  fi
+
+  # Do the quick check again, if there were no commits since the above we know we have the best common-ancestor:
+  if [ "$original_head_commit" = "$subrepo_parent" ]; then
     return
   fi
 
@@ -891,7 +977,7 @@ get-best-common-ancestor-for-merge() {
   local outer_loop_term_tree=""
   #RUN doesn't support piping completely, must do this process substition to get output of mktree
   OUT=true RUN git mktree < <(git ls-tree "$subrepo_parent:$subdir" | sed -r '/^.*\.gitrepo.*$/d')
-  if [ -z $output ]; then
+  if [ -z "$output" ]; then
     say "Failed to obtain tree-id of $subdir in relevant clone/pull commit object without .gitrepo file"
     return
   fi
@@ -926,6 +1012,7 @@ get-best-common-ancestor-for-merge() {
         # We have discovered that the subrepo had been pushed to from $original_head_branch since the last clone/pull.
         #  We know that $i is the best common ancestor!
         subrepo_parent="$i"
+        say "New best common ancestor found subrepo_parent:$subrepo_parent"
         return
       fi
     done
