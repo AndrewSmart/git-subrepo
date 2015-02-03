@@ -545,20 +545,34 @@ subrepo:commit() {
   o "Remove old content of the subdir."
   (
     cd "./$subdir"
-    RUN rm -fr $(ls -A)
+    RUN rm -f $(git ls-files)
   )
 
   o "Put remote subrepo content into '$subdir/'."
   GIT_WORK_TREE="$subdir" RUN git reset --hard "$subrepo_commit_ref"
 
+  # Get tracked files.
+  OUT=true RUN git ls-files
+  local tracked_files=${output//$'\n'/ }
+
   o "Reset index to original commit"
   RUN git reset --mixed "$original_head_commit"
+
+  # Get tracked files.
+  local cwd=$(pwd)
+  cd "./$subdir"
+  OUT=true RUN git ls-files
+  tracked_files+=" ${output//$'\n'/ }"
+  cd "$cwd"
 
   o "Put info into '$subdir/.gitrepo' file."
   update-gitrepo-file
 
+  # Make tracked files relative to root of repo
+  tracked_files="$subdir/${tracked_files// / $subdir/}"
+
   o "Add '$subdir/' content to the index."
-  RUN git add -A "$subdir"
+  RUN git add -A -- $tracked_files $subdir/.gitrepo
 
   o "Commit to the '$original_head_branch' branch."
   RUN git commit -m "$(get-commit-message)"
